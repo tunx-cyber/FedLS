@@ -1,0 +1,108 @@
+import re
+import re
+from vllm import LLM, SamplingParams
+from datasets import load_dataset
+import argparse
+import math_util
+from fraction import Fraction
+
+
+def format_gsm8k_prompt(example):
+    # 使用与微调相同的模板
+    alpaca_template = """Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+{}
+
+### Response:
+Let's think step by step.
+"""
+    return alpaca_template.format(example)
+
+def is_digit(s):
+    try:
+        float(str(s).replace(",", ""))
+        return True
+    except ValueError:
+        return False
+
+def is_number(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        pass
+    try:
+        import unicodedata
+        unicodedata.numeric(s)
+        return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def extract_answer_number(completion):
+    text = completion.split('The answer is: ')
+    if len(text) > 1:
+        extract_ans = text[-1].strip()
+        match = re.search(r'[\-+]?\d*[\.,/]?\d+', extract_ans)
+        if match:
+            if '/' in match.group():
+                denominator = match.group().split('/')[1]
+                numerator = match.group().split('/')[0]
+                if is_number(denominator) == True and is_number(numerator) == True:
+                    if denominator == '0':
+                        return round(float(numerator.replace(',', '')))
+                    else:
+                        frac = Fraction(match.group().replace(',', ''))
+                        num_numerator = frac.numerator
+                        num_denominator = frac.denominator
+                        return round(float(num_numerator / num_denominator))
+                else:
+                    return None
+            else:
+                if float(match.group().replace(',', '')) == float('inf'):
+                    return None
+                return round(float(match.group().replace(',', '')))
+        else:
+            return None
+    else:
+        return None
+
+def get_dataset_from_file():
+    dataset = load_dataset("openai/gsm8k","main", split="test")
+    return dataset
+
+def test(model):
+    stop_tokens = ["Instruction:", "Instruction", "Response:", "Response"]
+    sampling_params = SamplingParams(temperature=0, top_p=1, max_tokens=256, stop=stop_tokens)
+    dataset = get_dataset_from_file()
+    llm = LLM(model=model, tensor_parallel_size=4,gpu_memory_utilization=0.7)
+    batch_size = 128
+    generate_res = []
+    print("generating responses...")
+
+    for i in range(0, len(dataset), batch_size):
+        batch = dataset[i: i+batch_size]
+        prompts = [format_gsm8k_prompt(q) for q in batch["question"]]
+        outputs = llm.generate(prompts, sampling_params)
+        for output in outputs:
+            generated_text = output.outputs[0].text.strip()
+            generate_res.append(generated_text)
+
+    print("evaluating responses...")
+    correct = 0
+    for i, ex in enumerate(dataset):
+        prediction = extract_answer_number(generate_res[i])
+        ground_truth = ex['answer'].split('#### ')[1]
+        ground_truth = int(ground_truth.replace(',', ''))
+        if float(prediction) == float(ground_truth) or math_util.math_equal(prediction, ground_truth):
+            correct += 1
+    accuracy = correct / len(dataset)
+    print(f"Accuracy: {accuracy:.4f}")
+    return accuracy
+
+if __name__ == "__main__":
+    model = "math_model"
+    test(model=model)
+    print("Testing completed.")
