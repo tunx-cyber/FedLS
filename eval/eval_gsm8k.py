@@ -3,7 +3,7 @@ import re
 from vllm import LLM, SamplingParams
 from datasets import load_dataset
 import argparse
-import math_util
+from . import math_util
 from fraction import Fraction
 
 
@@ -71,6 +71,7 @@ def extract_answer_number(completion):
 
 def get_dataset_from_file():
     dataset = load_dataset("openai/gsm8k","main", split="test")
+    # dataset = load_dataset("json",data_files="dataset/gsm8k_test.jsonl",split="train")
     return dataset
 
 def test(model):
@@ -96,13 +97,18 @@ def test(model):
         prediction = extract_answer_number(generate_res[i])
         ground_truth = ex['answer'].split('#### ')[1]
         ground_truth = int(ground_truth.replace(',', ''))
-        if float(prediction) == float(ground_truth) or math_util.math_equal(prediction, ground_truth):
+        if prediction and float(prediction) == float(ground_truth) or math_util.math_equal(prediction, ground_truth):
             correct += 1
     accuracy = correct / len(dataset)
     print(f"Accuracy: {accuracy:.4f}")
     return accuracy
 
+import argparse
 if __name__ == "__main__":
-    model = "math_model"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model",type=str,default='math_model')
+    try: parsed = parser.parse_args()
+    except IOError as msg: parser.error(str(msg))
+    model = parsed.model
     test(model=model)
     print("Testing completed.")

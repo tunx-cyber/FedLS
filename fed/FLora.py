@@ -1,20 +1,20 @@
 # stack matrix
 from utils.utils import cosine_learning_rate, get_model_and_tokenizer, draw_loss_curve, setup_logger, get_peft_config
-from utils.data import get_dataset, split_dataset, SFTDataset, get_dataset_this_round
+from utils.data import get_dataset, split_dataset, SFTDataset, get_dataset_this_round,get_classification_dataset,ClassificationDataset
 from peft import get_peft_model, get_peft_model_state_dict
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
 import copy
 from datetime import datetime
-
-class FLora:
+from .FedBase import FedBase
+class FLora(FedBase):
     def __init__(self, args):
-        self.args = args
+        super(FLora,self).__init__(args)
     
     def run(self):
         args = self.args
-        logger = setup_logger(args.fed_alg, f"./logs/{args.fed_alg}_{args.dataset_name}.txt")
+        logger = setup_logger(args.fed_alg, f"./logs/{args.fed_alg}/{args.dataset_name.replace('/','_')}.txt")
         # init model and tokenizer
         model, tokenizer = get_model_and_tokenizer(args)
         peft_config = get_peft_config(args)
@@ -23,8 +23,20 @@ class FLora:
         # set up scale for lora update
         self.lora_scale = args.peft_lora_alpha / args.peft_lora_r
         # set up datasets
-        dataset = get_dataset(args.dataset_name, args.dataset_sample)
-        local_datasets = split_dataset(args, dataset)
+        if args.task == "classification":
+            train_dataset,test_dataset, _ = get_classification_dataset(args.dataset_name, args.dataset_sample)
+            test_dataset = ClassificationDataset(
+                args.dataset_name,
+                test_dataset, 
+                tokenizer, 
+            )
+            test_dataloder = DataLoader(test_dataset, batch_size=64)
+            accuracy = self.eval_model(model, test_dataloder)
+            print(f"Initial Test Accuracy: {accuracy}")
+        elif args.task == "sft":
+            train_dataset = get_dataset(args.dataset_name, args.dataset_sample)
+        
+        local_datasets = split_dataset(args, train_dataset)
 
         rounds_loss = []
         for r in range(args.num_rounds):
@@ -42,8 +54,20 @@ class FLora:
                 client_model = get_peft_model(client_model, peft_config)
                 client_model.cuda()
                 # get dataloader this round
-                dataset_this_round = get_dataset_this_round(local_datasets[client_id], r, args)
-                dataset_this_round = SFTDataset(dataset_this_round, tokenizer, template_name=args.template, max_len=args.seq_len)
+                if args.task == "sft":
+                    dataset_this_round = get_dataset_this_round(local_datasets[client_id], r, args)
+                    dataset_this_round = SFTDataset(dataset_this_round, 
+                                                    tokenizer, 
+                                                    template_name=args.template, 
+                                                    max_len=args.seq_len, 
+                                                    math_reason=True if "math" in args.dataset_name else False)
+                elif args.task == "classification":
+                    dataset_this_round = get_dataset_this_round(local_datasets[client_id], r, args)
+                    dataset_this_round = ClassificationDataset(
+                        args.dataset_name,
+                        dataset_this_round, 
+                        tokenizer, 
+                    )
                 sample_num_list.append(len(dataset_this_round))
                 local_dataloader = DataLoader(dataset_this_round, batch_size=args.batch_size, shuffle=True)
                 # recieve the local model
@@ -52,40 +76,23 @@ class FLora:
                 local_dict_list.append(copy.deepcopy(get_peft_model_state_dict(client_model)))
                 round_loss.append(loss)
                 # del client_model
-                # torch.cuda.empty_cache()  # 清理GPU缓存
+                torch.cuda.empty_cache()  # 清理GPU缓存
             
             # Aggregate the local models to update the global model
             model = self.aggerate_local_models(model, local_dict_list, sample_num_list)
 
             avg_loss = sum(round_loss)/len(round_loss)
             rounds_loss.append(avg_loss)
+            if args.task == "classification":
+                accuracy = self.eval_model(model, test_dataloder)
+                logger.info(f"Round {r+1} test Accuracy: {accuracy}")
 
         model.save_pretrained(f"./output/{args.fed_alg}/{args.dataset_name.replace('/','_')}")
         tokenizer.save_pretrained(f"./output/{args.fed_alg}/{args.dataset_name.replace('/','_')}")
         logger.info("loss data:")
         logger.info(rounds_loss)
-        draw_loss_curve(range(args.num_rounds), rounds_loss, args)
+        # draw_loss_curve(range(args.num_rounds), rounds_loss, args)
     
-    def local_train(self, model, local_dataloader, lr, args):
-        # torch.compile(model)
-        steps = 0
-        training_loss = 0
-        for epoch in range(args.epochs):
-            print(f"Epoch {epoch + 1}/{args.epochs}")
-            model.train()
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-            for idx, batch in enumerate(local_dataloader):
-                batch = {k: v.to(model.device) for k, v in batch.items()}
-                outputs = model(**batch)
-                loss = outputs.loss
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                print(f"{datetime.now()} Loss: {loss.item()}")
-                steps += 1
-                training_loss += loss.item()
-        
-        return model, training_loss/steps
     
     def aggerate_local_models(self, model, local_dict_list, sample_num_list):
         """
@@ -94,6 +101,13 @@ class FLora:
         model.cuda()
         total_samples = sum(sample_num_list)
 
+        # deal with classifier
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if "classifier" in name:
+                    local_key = "base_model.model." + name
+                    param.data = sum([local_dict[local_key] * sample_num_list[idx] / total_samples 
+                                        for idx, local_dict in enumerate(local_dict_list)])
         # 初始化聚合后的 A、B
         global_A, global_B = {}, {}
 
@@ -105,7 +119,6 @@ class FLora:
                         pk = n / total_samples
                         stacked_A.append(state[key] * pk)  # 对 A 加权
                     global_A[key] = torch.cat(stacked_A, dim=0)
-
                 elif "lora_B" in key:
                     stacked_B = []
                     for state, n in zip(local_dict_list, sample_num_list):
@@ -124,5 +137,4 @@ class FLora:
                     B = global_B[lora_b_key]
                     delta_w = self.lora_scale * torch.matmul(B,A)
                     param.data += delta_w
-        model.cpu()
         return model

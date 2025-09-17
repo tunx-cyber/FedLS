@@ -11,15 +11,27 @@ alpaca_template = """Below is an instruction that describes a task. Write a resp
 ### Response:
 """
 
+aplaca_two = """Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+{} 
+
+### Response:
+{}
+
+### Instruction:
+{} 
+
+### Response:
+"""
+
 api_key = "sk-ff8238fda8954c9baf9d8a24310310ff"
 JUDGE_MODEL = "deepseek-chat"  # 可以换成 gpt-4o, gpt-4-turbo 等
 client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 def generate_prompt(prompt, context=None):
     if context:
         # 如果有上下文，将其添加到 prompt 中
-        prompt = f'The following is a conversation between a user and an assistant.\nPlease continue by answering the last question.\nConversation history:\nUser: {context[0]}\nAssistant:{context[1]}'
-        prompt = prompt + "\nUser: " + prompt
-        prompt = alpaca_template.format(prompt)
+        prompt = aplaca_two.format(context[0],context[1],prompt)
     else:
         prompt = alpaca_template.format(prompt)
     
@@ -80,8 +92,13 @@ def test(model):
         ans1 = ans1[0].outputs[0].text.strip()
 
         # second turn inference
-        ans2 = llm.generate(generate_prompt(turn2, context=[turn1, ans1]),sampling_params=sampling_params)
-        ans2 = ans2[0].outputs[0].text.strip()
+        try:
+            ans2 = llm.generate(generate_prompt(turn2, context=[turn1, ans1]),sampling_params=sampling_params)
+            ans2 = ans2[0].outputs[0].text.strip()
+        except ValueError as e:
+            print(ValueError)
+            print("We skip")
+            continue
 
         # score the two turns
         s1 = judge_answer(turn1, ans1, turn=1)

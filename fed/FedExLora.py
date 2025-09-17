@@ -6,14 +6,14 @@ from torch.utils.data import DataLoader
 import numpy as np
 import copy
 from datetime import datetime
-
-class FedEx:
+from .FedBase import FedBase
+class FedEx(FedBase):
     def __init__(self, args):
-        self.args = args
+        super(FedEx,self).__init__(args)
 
     def run(self):
         args = self.args
-        logger = setup_logger(args.fed_alg, f"./logs/{args.fed_alg}_{args.dataset_name}.txt")
+        logger = setup_logger(args.fed_alg, f"./logs/{args.fed_alg}/{args.dataset_name.replace('/','_')}.txt")
         # init model and tokenizer
         model, tokenizer = get_model_and_tokenizer(args)
         peft_config = get_peft_config(args)
@@ -29,7 +29,7 @@ class FedEx:
 
         # set up datasets
         if args.task == "classification":
-            train_dataset, _, test_dataset = get_classification_dataset(args.dataset_name, args.dataset_sample)
+            train_dataset, test_dataset, _ = get_classification_dataset(args.dataset_name, args.dataset_sample)
             test_dataset = ClassificationDataset(
                 args.dataset_name,
                 test_dataset, 
@@ -45,20 +45,19 @@ class FedEx:
 
         rounds_loss = []
         for r in range(args.num_rounds):
-            print(f"Round {r + 1}/{args.num_rounds}")
-
             sample_num_list = []
             participants = np.random.choice(range(args.num_clients), args.num_clients_per_round, replace=False)
-            if args.task == "sft":
-                new_lr = cosine_learning_rate(r, args.num_rounds, args.lr, 1e-6)
-            else:
-                new_lr = args.lr 
+            new_lr = cosine_learning_rate(r, args.num_rounds, args.lr, 1e-6)
             round_loss = []
             local_dict_list = []
             for client_id in participants:
                 print(f">> ==================== Round {r+1} : {client_id} ====================")
                 # send the global model to the client
-                set_peft_model_state_dict(model, global_dict)
+                if args.task == "sft":
+                    set_peft_model_state_dict(model, global_dict)
+                else:
+                    set_peft_model_state_dict(model, copy.deepcopy(global_dict))# fast fix bug here
+                
                 # get dataloader this round
                 if args.task == "sft":
                     dataset_this_round = get_dataset_this_round(local_datasets[client_id], r, args)
@@ -68,12 +67,16 @@ class FedEx:
                                                     max_len=args.seq_len, 
                                                     math_reason=True if "math" in args.dataset_name else False)
                 elif args.task == "classification":
+                    dataset_this_round = get_dataset_this_round(local_datasets[client_id], r, args)
                     dataset_this_round = ClassificationDataset(
                         args.dataset_name,
-                        local_datasets[client_id], 
+                        dataset_this_round, 
                         tokenizer, 
                     )
 
+                # for key, param in model.named_parameters():
+                #     if param.requires_grad == True:
+                #         print(key)
                 sample_num_list.append(len(dataset_this_round))
 
                 local_dataloader = DataLoader(dataset_this_round, batch_size=args.batch_size, shuffle=True)
@@ -88,64 +91,27 @@ class FedEx:
             rounds_loss.append(sum(round_loss)/len(round_loss))
 
             if args.task == "classification":
-                set_peft_model_state_dict(model, global_dict)
+                set_peft_model_state_dict(model, copy.deepcopy(global_dict))
                 accuracy = self.eval_model(model, test_dataloder)
-                print(f"Round {r+1} test Accuracy: {accuracy}")
+                logger.info(f"Round {r+1} test Accuracy: {accuracy}")
                 
         model.save_pretrained(f"./output/{args.fed_alg}/{args.dataset_name.replace('/','_')}")
         tokenizer.save_pretrained(f"./output/{args.fed_alg}/{args.dataset_name.replace('/','_')}")
         logger.info("loss data:")
         logger.info(rounds_loss)
-        draw_loss_curve(range(args.num_rounds),rounds_loss,args)
+        # draw_loss_curve(range(args.num_rounds),rounds_loss,args)
     
-    def local_train(self, model, local_dataloader, lr, args):
-        # torch.compile(model)
-        model.train()
-        steps = 0
-        training_loss = 0
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        for epoch in range(args.epochs):
-            for idx, batch in enumerate(local_dataloader):
-                batch = {k: v.to(model.device) for k, v in batch.items()}
-                outputs = model(**batch)
-                loss = outputs.loss
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                print(f"{datetime.now()} Loss: {loss.item()}")
-                steps += 1
-                training_loss += loss.item()
-        
-        return model, training_loss/steps
-
-    def eval_model(self, model, eval_dataloader):
-        model.eval()
-        total = 0
-        correct = 0
-        with torch.no_grad():
-            for idx, batch in enumerate(eval_dataloader):
-                batch = {k: v.to(model.device) for k, v in batch.items()}
-                outputs = model(**batch)
-                logits = outputs.logits
-                predictions = torch.argmax(logits, dim=-1)
-                total += batch["labels"].size(0)
-                correct += (predictions == batch["labels"]).sum().item()
-        accuracy = correct / total
-        return accuracy
+    
     def aggerate_local_models(self, global_model, local_dict_list):
         # print(local_dict_list[0].keys())
         global_dict = global_model.state_dict()
-
+        
         for k in global_dict.keys():
-            if "classifier" in k:
+            if "classifier.modules_to_save" in k:
+                local_key = k.replace(".modules_to_save.default","")
                 global_dict[k] = torch.stack(
-                    [local_dict_list[i][k].float() for i in range(len(local_dict_list))], 0
+                    [local_dict_list[i][local_key].float() for i in range(len(local_dict_list))], 0
                 ).mean(0)
-
-        for client_dict in local_dict_list:
-            for k in global_dict.keys():
-                if "classifier" in k:
-                    client_dict[k] = global_dict[k]
 
         for name, module in global_model.named_modules():
             if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
@@ -174,7 +140,7 @@ class FedEx:
                 
                 global_dict[name + ".lora_A.default.weight"] = lora_A_avg
                 global_dict[name + ".lora_B.default.weight"] = lora_B_avg
-                global_dict[name + ".base_layer.weight"] += residue* scaling_factor
+                global_dict[name + ".base_layer.weight"] += residue * scaling_factor
                 
 
         global_model.load_state_dict(global_dict)

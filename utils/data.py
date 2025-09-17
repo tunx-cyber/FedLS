@@ -123,21 +123,23 @@ def get_classification_dataset(dataset_name, dataset_sample):
     ):
         train_dataset = dataset["train"]
         val_dataset = dataset["validation"]
-        test_dataset = dataset["test"]
+        # test_dataset = dataset["test"]
     elif dataset_name == "mnli_matched":
         train_dataset = dataset["train"]
         val_dataset = dataset["validation_matched"]
-        test_dataset = dataset["test_matched"]
+        # test_dataset = dataset["test_matched"]
     elif dataset_name == "mnli_mismatched":
         train_dataset = dataset["train"]
         val_dataset = dataset["validation_mismatched"]
-        test_dataset = dataset["test_mismatched"]
+        # test_dataset = dataset["test_mismatched"]
 
-    # if dataset_sample:
-    #     num_sample = min(len(dataset["train"]), dataset_sample)
-    #     train_dataset = train_dataset.select(range(num_sample))
+    if dataset_sample:
+        num_sample = min(len(dataset["train"]), dataset_sample)
+        train_dataset = train_dataset.select(range(num_sample))
+        # num_sample = min(len(val_dataset), 1000)
+        # val_dataset = val_dataset.select(range(num_sample))
 
-    return train_dataset, val_dataset, test_dataset
+    return train_dataset, val_dataset, None
 
 def get_dataset_this_round(dataset, round, args):
     num2sample = args.batch_size * args.gradient_accumulation_steps * args.max_steps
@@ -148,6 +150,76 @@ def get_dataset_this_round(dataset, round, args):
 
     return dataset_this_round
 
+import numpy as np
+from datasets import load_dataset
+from collections import defaultdict
+import random
+
+def partition_data_dirichlet(dataset, num_clients, alpha, seed=42):
+    """
+    使用狄利克雷分布将数据集分配给多个客户端
+    
+    参数:
+    dataset: 包含'label'和'text'字段的数据集
+    num_clients: 客户端数量
+    alpha: 狄利克雷分布的浓度参数(alpha越小，数据分布越不均匀)
+    seed: 随机种子
+    
+    返回:
+    分配给每个客户端的数据索引字典
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    # 获取所有标签
+    labels = np.array(dataset['label'])
+    num_classes = len(set(labels))
+    
+    # 按类别分组数据索引
+    class_indices = defaultdict(list)
+    for idx, label in enumerate(labels):
+        class_indices[label].append(idx)
+    
+    # 为每个类别生成狄利克雷分布
+    client_proportions = np.random.dirichlet([alpha] * num_clients, size=num_classes)
+    
+    # 分配数据到客户端
+    client_indices = defaultdict(list)
+    
+    for class_id, indices in class_indices.items():
+        # 打乱当前类别的数据
+        random.shuffle(indices)
+        
+        # 计算每个客户端应该获得的当前类别的数据量
+        proportions = client_proportions[class_id]
+        proportions = proportions / proportions.sum()  # 确保和为1
+        allocations = (proportions * len(indices)).astype(int)
+        
+        # 处理由于取整可能丢失的数据
+        allocated_total = allocations.sum()
+        if allocated_total < len(indices):
+            # 将剩余的数据分配给比例最大的客户端
+            remainder = len(indices) - allocated_total
+            min_client = np.argmin(proportions)
+            allocations[min_client] += remainder
+        
+        # 分配数据
+        start = 0
+        for client_id in range(num_clients):
+            end = start + allocations[client_id]
+            if end > len(indices):
+                end = len(indices)
+            client_indices[client_id].extend(indices[start:end])
+            start = end
+    
+    return client_indices
+
+# 获取特定客户端的数据
+def get_client_data(dataset, client_indices, client_id):
+    """获取指定客户端的数据"""
+    indices = client_indices[client_id]
+    return dataset.select(indices)
+
 
 def split_dataset(args, dataset: datasets.Dataset):
     dataset = dataset.shuffle(seed=args.seed)        # Shuffle the dataset
@@ -156,7 +228,10 @@ def split_dataset(args, dataset: datasets.Dataset):
     if args.split_strategy == "iid":
         for i in range(args.num_clients):
             local_datasets.append(dataset.shard(args.num_clients, i))
-    
+    else:
+        indices = partition_data_dirichlet(dataset, args.num_clients, args.alpha, seed=42)
+        for i in range(args.num_clients):
+            local_datasets.append(get_client_data(dataset, indices, i))
     return local_datasets
 
 class SFTDataset(Dataset):
@@ -179,7 +254,7 @@ class SFTDataset(Dataset):
                 return preprocess_alpaca(example, self.tokenizer, self.max_len)
             
 class ClassificationDataset(Dataset):
-    def __init__(self, task, data, tokenizer, max_len = 128):
+    def __init__(self, task, data, tokenizer, max_len = 256):
         self.task = task
         self.data = data
         self.tokenizer = tokenizer
@@ -196,7 +271,7 @@ class ClassificationDataset(Dataset):
                 example["hypothesis"],
                 truncation=True,
                 padding="max_length",
-                max_length=128,
+                max_length=self.max_len,
             )
         elif "question" in example and "sentence" in example:
             # QNLI and similar tasks
@@ -205,7 +280,7 @@ class ClassificationDataset(Dataset):
                 example["sentence"],
                 truncation=True,
                 padding="max_length",
-                max_length=128,
+                max_length=self.max_len,
             )
         elif "sentence1" in example and "sentence2" in example:
             # MRPC, STS-B
@@ -214,7 +289,7 @@ class ClassificationDataset(Dataset):
                 example["sentence2"],
                 truncation=True,
                 padding="max_length",
-                max_length=128,
+                max_length=self.max_len,
             )
         elif "question1" in example and "question2" in example:
             # QQP
@@ -223,7 +298,7 @@ class ClassificationDataset(Dataset):
                 example["question2"],
                 truncation=True,
                 padding="max_length",
-                max_length=128,
+                max_length=self.max_len,
             )
         elif "sentence" in example:
             # CoLA, SST-2
@@ -231,7 +306,7 @@ class ClassificationDataset(Dataset):
                 example["sentence"],
                 truncation=True,
                 padding="max_length",
-                max_length=128,
+                max_length=self.max_len,
             )
         else:
             raise ValueError(f"Unexpected format for task {self.task}")

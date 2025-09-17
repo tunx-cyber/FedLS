@@ -3,7 +3,7 @@ import re
 from vllm import LLM, SamplingParams
 from datasets import load_dataset
 import argparse
-import math_util
+from . import math_util
 
 def format_math_prompt(example):
     # 使用与微调相同的模板
@@ -48,8 +48,8 @@ def process_results(doc, completion, answer):
         return False
 
 def get_dataset_from_file():
-    dataset = load_dataset("dataset/MATH_test.jsonl")
-    return dataset
+    dataset = load_dataset('json',data_files="/root/llm/dataset/MATH_test.jsonl")
+    return dataset["train"]
 
 def test(model):
     stop_tokens = ["Instruction:", "Instruction", "Response:", "Response"]
@@ -80,7 +80,12 @@ def test(model):
     print(f"Accuracy: {accuracy:.4f}")
     return accuracy
 
+import argparse
 if __name__ == "__main__":
-    model = "math_model"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model",type=str,default='math_model')
+    try: parsed = parser.parse_args()
+    except IOError as msg: parser.error(str(msg))
+    model = parsed.model
     test(model=model)
     print("Testing completed.")

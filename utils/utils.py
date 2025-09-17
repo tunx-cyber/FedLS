@@ -33,6 +33,30 @@ def draw_loss_curve(x, y, args):
     plt.title('Loss Curve')
     plt.savefig(f"{args.fed_alg}_{str(args.dataset_name).replace('/','_')}_loss.png")
 
+def draw_glue_curve(task):
+    plt.figure(figsize=(10, 5))
+    algs = ["fedex","fedit","fedls","ffalora","flora"]
+    files = [f"logs/{alg}/{task}.txt" for alg in algs]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
+    x = range(1,201)
+    for c_idx, (file, alg) in enumerate(zip(files,algs)):
+        with open(file, 'r', encoding='utf-8') as f:
+            accuracy = []
+            for line_number, line in enumerate(f, 1):
+                idx = line.find("test Accuracy: ")
+                if idx != -1:
+                    acc = float(line[idx+len("test Accuracy: "):])
+                    accuracy.append(acc)
+                if len(accuracy) >= 200 :
+                    break
+            plt.plot(x, accuracy, colors[c_idx],label=alg)
+    plt.title(f'Test Accuracy on {task}')
+    plt.xlabel('Communication Round')
+    plt.ylabel('Accuracy')
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.savefig(f"{task}_accuracy.png")
+                
 def setup_logger(name, log_file, level=logging.INFO):
     
     logger = logging.getLogger(name)
@@ -83,7 +107,7 @@ def read_options():
     parser.add_argument("--dataset_name",
                         help='name of dataset;',
                         type=str,
-                        default='vicgalle/alpaca-gpt4')
+                        default='vicgalle/alpaca-gpt4')# zwhe99/commonsense_170k meta-math/MetaMathQA 
     
     parser.add_argument("--model_name",
                         help='training model;',
@@ -94,6 +118,11 @@ def read_options():
                         help='the split strategy. iid or non-iid, but in sft, we only support iid;',
                         type=str,
                         default="iid")
+    
+    parser.add_argument('--alpha',
+                        help='non iid alpha',
+                        type=float,
+                        default=0.5)
     
     parser.add_argument('--num_clients',
                         help='total clients',
@@ -128,7 +157,7 @@ def read_options():
     parser.add_argument('--epochs', 
                         help='number of epochs when clients train on data;',
                         type=int,
-                        default=1)
+                        default=1)# for glue it is 2
     
     parser.add_argument('--num_rounds',
                         help='number of communication rounds when clients train on data;',
@@ -138,7 +167,7 @@ def read_options():
     parser.add_argument('--seed',
                         help='seed for randomness;',
                         type=int,
-                        default=2025)
+                        default=42)
     
     parser.add_argument('--log_file',
                         help='logging output file',
@@ -168,17 +197,17 @@ def read_options():
     parser.add_argument('--peft_lora_r',
                         help='lora rank',
                         type=int,
-                        default=32)
+                        default=32)# 16 for glue
     
     parser.add_argument('--peft_lora_alpha',
                         help='lora alpha',
                         type=int,
-                        default=64)
+                        default=64)# 32 for glue
     
     parser.add_argument('--seq_len',
                         help='max sequence length for training',
                         type=int,
-                        default=512)
+                        default=512)# 128 for glue
     
     parser.add_argument('--template',
                         help='chat template',
@@ -248,7 +277,7 @@ def get_model_and_tokenizer(args):
             quantization_config=quantization_config,
             device_map=device_map,
             trust_remote_code=True,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
         )
 
     if args.load_in_4bit or args.load_in_8bit:
@@ -272,30 +301,9 @@ def get_peft_config(args):
             lora_alpha=args.peft_lora_alpha,
             lora_dropout=0.05,
             bias="none",
-            task_type="CAUSAL_LM" if args.task == "sft" else TaskType.SEQ_CLS,
-            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"] if args.task == "sft" 
-            else ["query", "key", "value","classifier.dense","classifier.out_proj"]
+            task_type=TaskType.CAUSAL_LM if args.task == "sft" else TaskType.SEQ_CLS,
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"] if args.task == "sft" else ["query", "value"]
         )
     else:
         peft_config = None
     return peft_config
-
-
-# def create_peft_model(num_labels, args):
-
-#     model = RobertaForSequenceClassification.from_pretrained(
-#         args.model, num_labels=num_labels
-#     )
-
-#     peft_config = LoraConfig(
-#         task_type="SEQ_CLS",
-#         r=args.lora_r,
-#         lora_alpha=args.lora_alpha,
-#         lora_dropout=args.lora_dropout,
-#         use_rslora=args.rslora,
-#         target_modules=["query", "value"],
-#     )
-
-#     model = get_peft_model(model, peft_config)
-
-#     return model

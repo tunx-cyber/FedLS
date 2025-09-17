@@ -52,6 +52,7 @@ def test(model, dataset_names = ["ARC-Challenge", "ARC-Easy", "boolq", "piqa", "
     sampling_params = SamplingParams(temperature=0.1, top_p=0.75, top_k=40, max_tokens=32, stop=stop_tokens)
     llm = LLM(model=model, tensor_parallel_size=4,gpu_memory_utilization=0.6)#tensor_parallel_size means the number of GPUs to use
     test_dict = {}
+    acc = []
     for dataset_name in dataset_names:
         data_path = f"dataset/{dataset_name}/test.json"
         dataset = get_dataset_from_file(data_path, dataset_name) # we can specify the detail
@@ -73,7 +74,9 @@ def test(model, dataset_names = ["ARC-Challenge", "ARC-Easy", "boolq", "piqa", "
                 correct += 1
         accuracy = correct / len(dataset)
         test_dict[dataset_name] = accuracy
+        acc.append(accuracy)
     print(test_dict)
+    print(sum(acc)/len(acc))
     return test_dict
 
 if __name__ == "__main__":
